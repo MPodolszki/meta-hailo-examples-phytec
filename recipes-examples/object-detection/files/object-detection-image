@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""YOLOv8n object detection on a single image, via the Hailo-8 AI accelerator."""
+
+import sys
+
+from object_detect.image_cli import main
+
+sys.exit(main())

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""YOLOv8n object detection on a live camera: Hailo-8 vs i.MX8MP CPU, side by side."""
+
+import sys
+
+from object_detect.camera_cli import run
+
+sys.exit(run("compare", require_source=False))

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Live YOLOv8n object detection from a camera, via the Hailo-8 AI accelerator."""
+
+import sys
+
+from object_detect.camera_cli import main
+
+sys.exit(main())
