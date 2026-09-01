@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Pairs one object-detection-* binary with object-detection-viewer.
+
+object_detect.camera_cli deliberately only writes an annotated JPEG (see its
+own module docstring) instead of opening a window, so that it works headless
+too. When a person runs object-detection-hailo-cam/-video/-image (or the
+generic object-detection-camera/-image) by hand expecting to *see* the
+result, that file needs a viewer -- this wraps a real binary (renamed to
+"<name>.real" by install-object-detection-viewers) together with
+object-detection-viewer, which sizes itself to whatever display (HDMI or
+LVDS) is actually active, same as the rest of this kiosk setup.
+
+Usage: _od-with-viewer <real-binary> [args...]
+"""
+
+import os
+import subprocess
+import sys
+
+DEFAULT_OUTPUT = "/run/object-detection-demo/camera.jpg"
+
+
+def _explicit_output(args):
+    for index, arg in enumerate(args):
+        if arg in ("-o", "--output") and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--output="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print("usage: _od-with-viewer <real-binary> [args...]", file=sys.stderr)
+        return 2
+
+    real_binary, *rest = argv
+
+    if any(flag in ("-h", "--help") for flag in rest):
+        # --help exits instantly and writes nothing to view -- just run it
+        # directly instead of also opening a viewer with nothing to show.
+        os.execvp(real_binary, [real_binary, *rest])
+
+    output_path = _explicit_output(rest) or DEFAULT_OUTPUT
+    command = [real_binary, *rest]
+    if output_path == DEFAULT_OUTPUT and _explicit_output(rest) is None:
+        command += ["-o", DEFAULT_OUTPUT]
+
+    proc = subprocess.Popen(command)
+    try:
+        subprocess.run(["object-detection-viewer", output_path])
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    return proc.returncode or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

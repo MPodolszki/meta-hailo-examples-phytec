@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Fullscreen viewer for the JPEG frame that object-detection-*-cam overwrites.
+
+object_detect.camera_cli deliberately writes each annotated frame to a file
+instead of opening a GTK/X11 window (see its module docstring), so it can run
+on images without a guaranteed display stack. This is the "live viewer
+polling the file" that comment refers to.
+
+Sizes itself to the actual monitor geometry at runtime instead of assuming a
+fixed resolution, so it works unmodified on both the HDMI and LVDS output the
+board's demo-orchestrator may have picked.
+"""
+
+import argparse
+import os
+import pathlib
+import sys
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
+
+DEFAULT_SOURCE = "/run/object-detection-demo/camera.jpg"
+READY_FILE = "/run/demo-loop/ready"
+POLL_MS = 150
+
+
+def touch_ready():
+    """Tells demo-orchestrator the camera pipeline is actually producing
+    frames, so it can start this slot's 30s countdown now."""
+    try:
+        pathlib.Path(READY_FILE).touch()
+    except OSError:
+        pass
+
+
+class Viewer(Gtk.Window):
+    def __init__(self, source):
+        Gtk.Window.__init__(self, title="Object Detection")
+        self.source = source
+        self.last_mtime = None
+
+        self.image = Gtk.Image()
+        self.placeholder = Gtk.Label(label="Waiting for camera frames...")
+        self.placeholder.set_markup('<span font="20">Waiting for camera frames...</span>')
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(self.placeholder, "placeholder")
+        self.stack.add_named(self.image, "image")
+        self.stack.set_visible_child_name("placeholder")
+        self.add(self.stack)
+
+        self.connect('destroy', lambda *_: Gtk.main_quit())
+        self.connect('key-press-event', self._on_key)
+        self.fullscreen()
+        GLib.timeout_add(POLL_MS, self._poll)
+
+    def _on_key(self, _widget, event):
+        # Escape lets someone running this by hand close it without needing
+        # to know the process name to Ctrl+C from another terminal.
+        if event.keyval == 65307:  # GDK_KEY_Escape
+            Gtk.main_quit()
+        return False
+
+    def _monitor_size(self):
+        display = Gdk.Display.get_default()
+        monitor = display.get_monitor(0)
+        geo = monitor.get_geometry()
+        return geo.width, geo.height
+
+    def _poll(self):
+        try:
+            mtime = os.path.getmtime(self.source)
+        except OSError:
+            return True
+
+        if mtime == self.last_mtime:
+            return True
+        self.last_mtime = mtime
+
+        try:
+            width, height = self._monitor_size()
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                self.source, width, height, True)
+        except GLib.Error:
+            # Frame was mid-write despite the writer's atomic replace; retry
+            # on the next poll.
+            return True
+
+        self.image.set_from_pixbuf(pixbuf)
+        if self.stack.get_visible_child_name() != "image":
+            self.stack.set_visible_child_name("image")
+            touch_ready()
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", nargs="?", default=DEFAULT_SOURCE,
+                         help=f"JPEG file to poll (default: {DEFAULT_SOURCE})")
+    args = parser.parse_args()
+
+    win = Viewer(args.source)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

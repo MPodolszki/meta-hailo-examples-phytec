@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Rotates the kiosk screen through the three demos, 30s each, forever.
+
+Display kind (hdmi/lvds) is detected once at boot by detect-display and
+handed off via /run/demo-display-kind; this process does not re-check it.
+
+Each demo touches /run/demo-loop/ready once it has actually finished loading
+its model/backend and has something interactive on screen (see
+demo-celebrity-face-match's aidemo.py, object-detection-viewer, and
+whisper-demo-gui). The orchestrator waits for that signal -- showing
+whatever loading screen the demo itself draws -- before starting that slot's
+30s countdown, so "loading the model" is visible time, not stolen from the
+30s the visitor actually gets to interact with the demo. A demo that never
+signals ready (e.g. an older binary) just gets the normal 30s from launch,
+after a bounded wait, so the loop can't stall forever on a missing signal.
+"""
+
+import logging
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("demo-orchestrator")
+
+KIND_FILE = "/run/demo-display-kind"
+# demo-loop.service declares RuntimeDirectory=demo-loop, which creates
+# /run/demo-loop owned by the weston user/group this service (and every
+# demo it launches) runs as -- plain /run is root-only, so this file has to
+# live in a subdirectory this user actually owns.
+READY_FILE = "/run/demo-loop/ready"
+# object_detect.camera_cli writes each frame via os.replace() over this
+# fixed path. It lives in /run/object-detection-demo (mode 0777, no sticky
+# bit -- see /etc/tmpfiles.d/object-detection-demo.conf) specifically so
+# root and the weston user can both freely replace each other's leftover
+# file; a plain /tmp path bit us here once already (sticky bit means only
+# the file's *owner* may replace/delete it, so a maintainer test-running a
+# binary as root over ssh left a file the weston-run loop could never
+# overwrite again). Removing it before each slot is now just a second line
+# of defense, not the only thing standing between this and a blank screen.
+OBJECT_DETECTION_OUTPUT = "/run/object-detection-demo/camera.jpg"
+SLOT_SECONDS = 30
+# The info slot is plain text people need to actually read, not something
+# to glance at like the other demos -- give it more time on screen.
+INFO_SLOT_SECONDS = 60
+MAX_LOADING_SECONDS = 90
+POLL_SECONDS = 0.3
+KILL_GRACE_SECONDS = 2.0
+
+
+def read_display_kind():
+    try:
+        return pathlib.Path(KIND_FILE).read_text().strip() or "lvds"
+    except OSError:
+        log.warning("%s missing, assuming lvds", KIND_FILE)
+        return "lvds"
+
+
+def consume_ready():
+    try:
+        os.remove(READY_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def run_slot(name, commands, seconds=SLOT_SECONDS, wait_ready=True,
+              max_loading_seconds=MAX_LOADING_SECONDS, cleanup_paths=()):
+    """Run each command in *commands* (a list of argv lists) concurrently.
+
+    If *wait_ready*, first wait (up to *max_loading_seconds*) for the demo to
+    touch /run/demo-loop/ready -- that time is not part of the *seconds*
+    countdown. Then run for up to *seconds* more, and terminate everything.
+    Returns early if every process has already exited on its own.
+
+    *cleanup_paths* are removed (best-effort) before launching, in case a
+    previous run -- possibly under a different user -- left one behind in a
+    state this slot's processes can't overwrite (see OBJECT_DETECTION_OUTPUT).
+    """
+    for path in cleanup_paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    consume_ready()
+    log.info("slot %s: starting %s", name, [c[0] for c in commands])
+
+    procs = []
+    try:
+        for argv in commands:
+            procs.append(subprocess.Popen(argv))
+    except Exception:  # noqa: BLE001
+        log.exception("slot %s: failed to launch", name)
+        for proc in procs:
+            proc.terminate()
+        time.sleep(1)
+        return
+
+    try:
+        if wait_ready:
+            loading_elapsed = 0.0
+            while loading_elapsed < max_loading_seconds:
+                time.sleep(POLL_SECONDS)
+                loading_elapsed += POLL_SECONDS
+
+                if consume_ready():
+                    log.info("slot %s: ready after %.1fs of loading", name, loading_elapsed)
+                    break
+                if all(proc.poll() is not None for proc in procs):
+                    log.warning("slot %s: exited while still loading", name)
+                    return
+            else:
+                log.warning("slot %s: no ready signal after %ss, starting slot anyway",
+                             name, max_loading_seconds)
+
+        elapsed = 0.0
+        while elapsed < seconds:
+            time.sleep(POLL_SECONDS)
+            elapsed += POLL_SECONDS
+
+            if all(proc.poll() is not None for proc in procs):
+                log.info("slot %s: all processes exited early", name)
+                break
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        for proc in procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    log.info("slot %s: done", name)
+
+
+def build_slots(kind):
+    return [
+        ("facematch",
+         [["demo-celebrity-face-match", "-c", "vm016", "-s", kind, "-f"]],
+         (),
+         SLOT_SECONDS),
+        ("object-detection",
+         # object-detection-compare-cam.real: Hailo-8 and CPU side by side,
+         # so the loop itself shows the comparison rather than Hailo alone.
+         # The unwrapped ".real" binary is used because the plain
+         # "object-detection-compare-cam" name is a wrapper (installed by
+         # install-object-detection-viewers) that already pairs itself with
+         # object-detection-viewer for people running it by hand -- using it
+         # here too would start a second, redundant viewer window.
+         [["object-detection-compare-cam.real", "-o", OBJECT_DETECTION_OUTPUT],
+          ["object-detection-viewer", OBJECT_DETECTION_OUTPUT]],
+         (OBJECT_DETECTION_OUTPUT,),
+         SLOT_SECONDS),
+        ("whisper",
+         [["whisper-demo-gui"]],
+         (),
+         SLOT_SECONDS),
+        ("info",
+         [["demo-info-screen"]],
+         (),
+         INFO_SLOT_SECONDS),
+    ]
+
+
+def main():
+    kind = read_display_kind()
+    log.info("display kind: %s", kind)
+    slots = build_slots(kind)
+
+    running = True
+
+    def handle_term(_signum, _frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    while running:
+        for name, commands, cleanup_paths, seconds in slots:
+            if not running:
+                break
+            try:
+                run_slot(name, commands, seconds=seconds, cleanup_paths=cleanup_paths)
+            except Exception:  # noqa: BLE001
+                log.exception("slot %s: crashed, continuing loop", name)
+                time.sleep(1)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

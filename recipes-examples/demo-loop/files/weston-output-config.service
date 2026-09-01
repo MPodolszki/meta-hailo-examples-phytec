@@ -1,0 +1,12 @@
+[Unit]
+Description=Detect connected display (HDMI/LVDS) and configure Weston output
+Before=weston.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/detect-display
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target

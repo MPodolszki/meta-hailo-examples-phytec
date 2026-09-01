@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Static 4th slot in the demo loop: points at the other, manually-startable
+demo commands (the loop only auto-rotates Facematch / Object Detection /
+Whisper) and explains how to stop the loop itself.
+
+No model to load, so it touches /run/demo-loop/ready immediately -- the
+demo-orchestrator's loading-wait is a no-op here, the full slot time is
+spent showing this screen.
+"""
+
+import pathlib
+import sys
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk
+
+READY_FILE = "/run/demo-loop/ready"
+
+# (command, one-line explanation)
+OTHER_DEMOS = [
+    ("object-detection-image [-b hailo|cpu]",
+     "Objekterkennung auf einem einzelnen Bild, Ergebnis sofort sichtbar"),
+    ("object-detection-hailo-video / -cpu-video <Datei>",
+     "Objekterkennung auf einer Videodatei statt Livebild"),
+    ("object-detection-compare-cam / -compare-video",
+     "Hailo-8 und CPU gleichzeitig, Seite an Seite mit FPS-Anzeige"),
+    ("object-detection-benchmark",
+     "Reiner Geschwindigkeitsvergleich Hailo-8 vs. CPU (nur Text, keine Anzeige)"),
+    ("whisper-cpu [Datei.wav]",
+     "Spracherkennung nur auf der i.MX8MP-CPU statt auf dem Hailo-8"),
+    ("whisper-hailo -m",
+     "Spracherkennung von einem angeschlossenen Mikrofon (eigene Stimme)"),
+    ("whisper-benchmark",
+     "Geschwindigkeitsvergleich Hailo-8 vs. CPU (nur Text, keine Anzeige)"),
+]
+
+
+def touch_ready():
+    try:
+        pathlib.Path(READY_FILE).touch()
+    except OSError:
+        pass
+
+
+class InfoScreen(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="More Demos")
+        self.connect('destroy', lambda *_: Gtk.main_quit())
+        self.connect('key-press-event', self._on_key)
+        self._apply_css()
+        self._build_ui()
+        self.fullscreen()
+
+    def _apply_css(self):
+        css = b"""
+        .title { font-size: 40px; font-weight: bold; }
+        .subtitle { font-size: 20px; color: #333333; }
+        .cmd { font-size: 22px; font-family: monospace; font-weight: bold; }
+        .desc { font-size: 18px; color: #222222; }
+        .stop-hint { font-size: 16px; color: #555555; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _build_ui(self):
+        title = Gtk.Label(label="More demos are available on this board")
+        title.get_style_context().add_class("title")
+
+        subtitle = Gtk.Label(
+            label="This loop only cycles Facematch / Object Detection / Whisper. "
+                  "Run any of these yourself via the Debug UART (cable included in the kit):")
+        subtitle.set_line_wrap(True)
+        subtitle.get_style_context().add_class("subtitle")
+
+        grid = Gtk.Grid(row_spacing=14, column_spacing=24)
+        grid.set_halign(Gtk.Align.CENTER)
+        for row, (command, description) in enumerate(OTHER_DEMOS):
+            cmd_label = Gtk.Label(label=command)
+            cmd_label.set_halign(Gtk.Align.START)
+            cmd_label.get_style_context().add_class("cmd")
+
+            desc_label = Gtk.Label(label=description)
+            desc_label.set_halign(Gtk.Align.START)
+            desc_label.set_line_wrap(True)
+            desc_label.get_style_context().add_class("desc")
+
+            grid.attach(cmd_label, 0, row, 1, 1)
+            grid.attach(desc_label, 1, row, 1, 1)
+
+        stop_hint = Gtk.Label(
+            label="Admin: to stop this rotation, run "
+                  "systemctl stop demo-loop.service via the Debug UART")
+        stop_hint.get_style_context().add_class("stop-hint")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        box.set_border_width(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.pack_start(title, False, False, 0)
+        box.pack_start(subtitle, False, False, 0)
+        box.pack_start(grid, False, False, 0)
+        box.pack_start(stop_hint, False, False, 0)
+        self.add(box)
+
+    def _on_key(self, _widget, event):
+        if event.keyval == 65307:  # GDK_KEY_Escape
+            Gtk.main_quit()
+        return False
+
+
+def main():
+    win = InfoScreen()
+    win.show_all()
+    touch_ready()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

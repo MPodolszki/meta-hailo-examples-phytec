@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Small fullscreen GUI around whisper_bench's Hailo-8 speech-to-text.
+
+Reuses whisper_bench's own building blocks directly (backend, audio,
+tokenizer) instead of shelling out to whisper-hailo and parsing its stdout,
+so the GUI can show the transcript live and control playback.
+
+Transcribes the bundled jfk.wav once at startup and displays + plays it.
+Live microphone recording is intentionally not part of this loop demo (it
+didn't work reliably here); use whisper-hailo -m directly for that -- it is
+one of the other demo configurations that stay manually startable.
+"""
+
+import pathlib
+import re
+import subprocess
+import sys
+import threading
+import types
+import logging
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk
+
+sys.path.insert(0, "/usr/lib/python3.12/site-packages")
+
+from whisper_bench.cli import DEFAULT_DATA_DIR, _asset, _make_backend
+from whisper_bench import audio as audio_module
+from whisper_bench.tokenizer import WhisperTokenizer
+from whisper_bench.transcribe import transcribe
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("whisper-demo-gui")
+
+READY_FILE = "/run/demo-loop/ready"
+
+
+def touch_ready():
+    """Tells demo-orchestrator "the loading screen is done, start the 30s
+    countdown now" -- see its module docstring."""
+    try:
+        pathlib.Path(READY_FILE).touch()
+    except OSError:
+        pass
+
+
+def _alsa_cards():
+    """[(index, name), ...] from /proc/asound/cards, e.g. [(0, 'audiohdmi'), (1, 'USB')]."""
+    cards = []
+    try:
+        text = pathlib.Path("/proc/asound/cards").read_text()
+    except OSError:
+        return cards
+    for match in re.finditer(r"^\s*(\d+)\s+\[(\S*)\s*\]:", text, re.MULTILINE):
+        cards.append((int(match.group(1)), match.group(2)))
+    return cards
+
+
+def detect_usb_speaker():
+    """Any ALSA card besides the SoC's built-in 'audiohdmi' counts as
+    external playback hardware."""
+    return any(name != "audiohdmi" for _index, name in _alsa_cards())
+
+
+def play_wav(path):
+    """PulseAudio auto-spawns on this desktop session and holds the ALSA
+    device exclusively, so a plain aplay fails with 'Device or resource
+    busy' -- go through paplay (falling back to aplay if Pulse isn't
+    running) instead of disabling Pulse."""
+    for player in (["paplay", str(path)], ["aplay", "-q", str(path)]):
+        try:
+            if subprocess.run(player, check=False).returncode == 0:
+                return
+        except FileNotFoundError:
+            continue
+
+
+class WhisperDemo(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="Whisper Speech-to-Text")
+        self.connect('destroy', lambda *_: Gtk.main_quit())
+        self.connect('key-press-event', self._on_key)
+
+        self.has_speaker = detect_usb_speaker()
+        log.info("has_speaker=%s", self.has_speaker)
+        self.backend = None
+        self.filters = None
+        self.tokenizer = None
+        self.sample_wav = None
+
+        self._build_ui()
+        self.fullscreen()
+
+        threading.Thread(target=self._load_and_run_sample, daemon=True).start()
+
+    # -- UI -----------------------------------------------------------
+    def _apply_css(self):
+        css = b"""
+        .title { font-size: 44px; font-weight: bold; }
+        .status { font-size: 26px; }
+        textview.transcript, textview.transcript text {
+            font-size: 40px;
+            background-color: transparent;
+        }
+        .hint { font-size: 20px; font-style: italic; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _build_ui(self):
+        self._apply_css()
+
+        self.title_label = Gtk.Label(label="Whisper-tiny on Hailo-8")
+        self.title_label.get_style_context().add_class("title")
+
+        self.status_label = Gtk.Label(label="Loading model...")
+        self.status_label.set_line_wrap(True)
+        self.status_label.get_style_context().add_class("status")
+
+        self.transcript_view = Gtk.TextView()
+        self.transcript_view.set_editable(False)
+        self.transcript_view.set_cursor_visible(False)
+        self.transcript_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.transcript_view.set_justification(Gtk.Justification.CENTER)
+        self.transcript_view.get_style_context().add_class("transcript")
+        self.transcript_buffer = self.transcript_view.get_buffer()
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.add(self.transcript_view)
+
+        self.speaker_hint = Gtk.Label()
+        self.speaker_hint.set_markup(
+            'To hear the audio you need to add a USB Speaker')
+        self.speaker_hint.get_style_context().add_class("hint")
+        self.speaker_hint.set_visible(not self.has_speaker)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_border_width(20)
+        box.pack_start(self.title_label, False, False, 0)
+        box.pack_start(self.status_label, False, False, 0)
+        box.pack_start(scroller, True, True, 0)
+        box.pack_start(self.speaker_hint, False, False, 0)
+        self.add(box)
+
+    def _on_key(self, _widget, event):
+        # Escape lets a booth attendant close the demo manually during setup.
+        if event.keyval == 65307:  # GDK_KEY_Escape
+            Gtk.main_quit()
+        return False
+
+    def _set_status(self, text):
+        GLib.idle_add(self.status_label.set_text, text)
+
+    def _set_transcript(self, text):
+        GLib.idle_add(self.transcript_buffer.set_text, text)
+
+    # -- Model / sample loading ---------------------------------------
+    def _load_and_run_sample(self):
+        log.info("loading backend...")
+        try:
+            args = types.SimpleNamespace(data_dir=DEFAULT_DATA_DIR)
+            self.filters = audio_module.load_mel_filters(
+                _asset(DEFAULT_DATA_DIR, "assets", "mel_filters.npz"))
+            self.tokenizer = WhisperTokenizer(
+                _asset(DEFAULT_DATA_DIR, "assets", "vocab.json"))
+            self.sample_wav = _asset(DEFAULT_DATA_DIR, "assets", "jfk.wav")
+
+            self._set_status("Loading Whisper-tiny on Hailo-8...")
+            self.backend = _make_backend("hailo", args)
+            self.backend.__enter__()
+        except Exception as error:  # noqa: BLE001
+            log.exception("backend load failed")
+            self._set_status(f"Could not load Whisper on Hailo-8: {error}")
+            touch_ready()
+            return
+
+        log.info("backend ready")
+        self._run_sample()
+
+    def _run_sample(self):
+        self._set_status("Transcribing sample audio on Hailo-8...")
+        try:
+            text, _info = transcribe(
+                self.backend, self.sample_wav, self.filters, self.tokenizer)
+        except Exception as error:  # noqa: BLE001
+            log.exception("sample transcription failed")
+            self._set_status(f"Transcription failed: {error}")
+            touch_ready()
+            return
+        log.info("sample transcript: %r", text)
+        self._set_status("Sample audio (John F. Kennedy, 1961):")
+        self._set_transcript(text)
+        touch_ready()
+        if self.has_speaker:
+            play_wav(self.sample_wav)
+
+    def shutdown(self):
+        if self.backend is not None:
+            try:
+                self.backend.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def main():
+    win = WhisperDemo()
+    win.show_all()
+    try:
+        Gtk.main()
+    finally:
+        win.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

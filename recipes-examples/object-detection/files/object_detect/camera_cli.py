@@ -17,6 +17,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -192,12 +193,79 @@ def _run_single(args, backend):
 
 
 def _label_frame(frame, text):
-    origin = (10, 24)
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 1, cv2.LINE_AA)
+    # A solid backing bar (rather than just a black outline around the
+    # text) keeps the fps label readable regardless of what's behind it --
+    # a bright window, skin tone, or light clothing in frame could wash out
+    # a thin outline. Bigger, bolder text on top of that so it reads at a
+    # glance on a demo screen viewed from a few meters away.
+    font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3
+    margin = 12
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+
+    bar_height = text_h + baseline + 2 * margin
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], bar_height), (0, 0, 0), -1)
+
+    origin = (margin, margin + text_h)
+    cv2.putText(frame, text, origin, font, scale, (0, 255, 255), thickness, cv2.LINE_AA)
     return frame
+
+
+class _BackgroundDetector:
+    """Runs one backend's inference on a background thread, on whatever
+    frame is newest whenever it's ready for another one.
+
+    The CPU backend takes ~10-20x longer per inference than Hailo-8 (see
+    object-detection-benchmark) -- ~800 ms per frame. _run_compare used to
+    call every backend synchronously, one after another, in its capture
+    loop, so that single slow CPU call blocked the *entire* loop -- Hailo
+    half and the live camera feed under both halves included -- down to the
+    CPU's ~1 fps pace every time it ran, even though Hailo alone reaches
+    10x+ that. Running it here instead means the capture loop only ever
+    hands over a frame and immediately reads back whatever detections this
+    thread finished last; it never waits on it.
+    """
+
+    def __init__(self, detector, extract, score_thres):
+        self.detector = detector
+        self.extract = extract
+        self.score_thres = score_thres
+        self.detections = []
+        self.fps = 0.0
+        self._runs = 0
+        self._elapsed = 0.0
+        self._lock = threading.Lock()
+        self._next_frame = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def submit(self, frame):
+        with self._lock:
+            self._next_frame = frame
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _loop(self):
+        model_h, model_w = self.detector.input_shape[:2]
+        while not self._stop.is_set():
+            with self._lock:
+                frame, self._next_frame = self._next_frame, None
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            start = time.perf_counter()
+            raw_output = self.detector.infer(preprocess(frame, model_w, model_h))
+            detections = self.extract(raw_output, frame.shape,
+                                       score_thres=self.score_thres)
+            self._elapsed += time.perf_counter() - start
+            self._runs += 1
+            self.fps = self._runs / self._elapsed
+            self.detections = detections
 
 
 def _run_compare(args):
@@ -221,8 +289,14 @@ def _run_compare(args):
         return 2
 
     labels = get_labels(labels_path)
+    hailo_detector, hailo_extract = detectors["hailo"]
+    hailo_model_h, hailo_model_w = hailo_detector.input_shape[:2]
+    cpu_detector, cpu_extract = detectors["cpu"]
+    cpu_worker = _BackgroundDetector(cpu_detector, cpu_extract, args.score_thres)
+    cpu_worker.start()
+
     frame_count = 0
-    elapsed = {backend: 0.0 for backend in BACKENDS}
+    hailo_elapsed = 0.0
     try:
         while args.frames is None or frame_count < args.frames:
             ok, frame = cap.read()
@@ -233,30 +307,31 @@ def _run_compare(args):
             if needs_debayer:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BAYER_GB2BGR)
 
-            halves, status_parts = [], []
-            for backend in BACKENDS:
-                detector, extract = detectors[backend]
-                model_h, model_w = detector.input_shape[:2]
+            cpu_worker.submit(frame)
 
-                start = time.perf_counter()
-                raw_output = detector.infer(preprocess(frame, model_w, model_h))
-                detections = extract(raw_output, frame.shape,
-                                      score_thres=args.score_thres)
-                elapsed[backend] += time.perf_counter() - start
+            start = time.perf_counter()
+            raw_output = hailo_detector.infer(preprocess(frame, hailo_model_w, hailo_model_h))
+            hailo_detections = hailo_extract(raw_output, frame.shape,
+                                              score_thres=args.score_thres)
+            hailo_elapsed += time.perf_counter() - start
+            hailo_fps = (frame_count + 1) / hailo_elapsed
 
-                fps = (frame_count + 1) / elapsed[backend]
-                half = draw_detections(frame.copy(), detections, labels)
-                halves.append(_label_frame(half, f"{LABELS[backend]}: {fps:.1f} fps"))
-                status_parts.append(f"{LABELS[backend]} {fps:5.1f} fps")
-
+            halves = [
+                _label_frame(draw_detections(frame.copy(), hailo_detections, labels),
+                             f"{LABELS['hailo']}: {hailo_fps:.1f} fps"),
+                _label_frame(draw_detections(frame.copy(), cpu_worker.detections, labels),
+                             f"{LABELS['cpu']}: {cpu_worker.fps:.1f} fps"),
+            ]
             _write_output(args.output, cv2.hconcat(halves))
 
             frame_count += 1
-            print(f"\rframe {frame_count:5d}  " + "  ".join(status_parts),
+            print(f"\rframe {frame_count:5d}  Hailo-8 {hailo_fps:5.1f} fps  "
+                  f"i.MX8MP CPU {cpu_worker.fps:5.1f} fps",
                   end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
+        cpu_worker.stop()
         print()
         cap.release()
         for detector, _ in detectors.values():
