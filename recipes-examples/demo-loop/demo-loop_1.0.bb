@@ -22,6 +22,7 @@ SRC_URI = " \
     file://output-detect.conf \
     file://99-hailo.rules \
     file://object-detection-demo.conf \
+    file://50-demo-loop-overrides.preset \
     file://README.md \
 "
 
@@ -72,6 +73,10 @@ do_install() {
     install -m 0644 ${WORKDIR}/object-detection-demo.conf \
         ${D}${sysconfdir}/tmpfiles.d/
 
+    install -d ${D}${systemd_unitdir}/system-preset
+    install -m 0644 ${WORKDIR}/50-demo-loop-overrides.preset \
+        ${D}${systemd_unitdir}/system-preset/
+
     install -d ${D}${docdir}/${BPN}
     install -m 0644 ${WORKDIR}/README.md ${D}${docdir}/${BPN}/
 }
@@ -88,13 +93,19 @@ FILES:${PN} = " \
     ${systemd_system_unitdir}/weston.service.d/output-detect.conf \
     ${sysconfdir}/udev/rules.d/99-hailo.rules \
     ${sysconfdir}/tmpfiles.d/object-detection-demo.conf \
+    ${systemd_unitdir}/system-preset/50-demo-loop-overrides.preset \
     ${docdir}/${BPN} \
 "
 
 # demo-celebrity-face-match ships its own always-on service; the loop takes
-# over as the sole autostart, so that one gets disabled below rather than
-# also fighting the loop for the screen. object-detection-*/whisper-* are
-# pure CLI tools with no autostart of their own, nothing to disable there.
+# over as the sole autostart, so that one gets disabled -- primarily by the
+# 50-demo-loop-overrides.preset installed above (which beats that recipe's
+# own 98-*.preset no matter what order the postinsts run in), with the
+# pkg_postinst below as a second net for upgrades on a live system.
+# Leaving it enabled is not cosmetic: it holds /dev/video0 for good and
+# every camera slot the loop then starts fails on a busy sensor.
+# object-detection-*/whisper-* are pure CLI tools with no autostart of
+# their own, nothing to disable there.
 RDEPENDS:${PN} += " \
     demo-celebrity-face-match \
     demo-object-detection \

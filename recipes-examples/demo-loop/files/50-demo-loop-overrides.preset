@@ -1,0 +1,14 @@
+# demo-celebrity-face-match's own recipe ships an always-on
+# demo-celebrity-face-match.service and, via SYSTEMD_AUTO_ENABLE, a
+# 98-demo-celebrity-face-match.preset that enables it. When demo-loop is
+# installed the loop is meant to be the sole autostart -- it launches
+# facematch itself as one of its slots -- so an independently running
+# service instance just sits on /dev/video0 forever and every camera slot
+# the loop then starts (facematch and object-detection alike) dies with
+# "setup-pipeline-csi1 ... returned non-zero exit status 1" and a kernel
+# "mipi_csis_set_fmt, set sensor format fail".
+#
+# 50- sorts before 98-, and systemd's first matching preset line wins, so
+# this deterministically beats that recipe's enable regardless of the order
+# the two packages' postinsts happen to run in.
+disable demo-celebrity-face-match.service
