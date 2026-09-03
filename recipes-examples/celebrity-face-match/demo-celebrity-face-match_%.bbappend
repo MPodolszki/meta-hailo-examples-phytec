@@ -19,6 +19,25 @@
 # silently rots into a fuzzy or failed apply on an SRCREV bump, whereas
 # each assert below names exactly what it could no longer find.
 
+# demo-loop is the sole autostart when it is installed -- it launches this
+# demo itself as one of its slots. Left enabled, this recipe's own service
+# starts at boot and holds /dev/video0 for good, and every camera slot the
+# loop then starts dies on a busy sensor.
+#
+# This has to be SYSTEMD_AUTO_ENABLE, not a preset file: with it set to
+# "enable", systemd.bbclass's postinst runs a plain
+# "systemctl --root=$D enable" during rootfs assembly, which creates the
+# multi-user.target.wants symlink unconditionally and never consults
+# presets at all -- the bbclass only calls "systemctl preset" in the
+# $D-is-empty branch, i.e. on a live system, never at image build time.
+# Setting "disable" instead skips that enable entirely and makes the
+# generated 98-*.preset say "disable".
+#
+# demo-loop's pkg_postinst also runs "systemctl disable" on this service,
+# but that only wins if it happens to run after this recipe's postinst,
+# which in the shipped image it did not.
+SYSTEMD_AUTO_ENABLE:${PN} = "disable"
+
 python do_patch:append() {
     import os
 
