@@ -114,8 +114,19 @@ RDEPENDS:${PN} += " \
     python3-pygobject \
     gtk+3 \
     alsa-utils \
-    pulseaudio-utils \
+    pulseaudio-server \
+    pulseaudio-misc \
 "
+
+# whisper-demo-gui plays its sample wav through paplay and only falls back
+# to aplay: PulseAudio autospawns in this session and holds the ALSA device
+# exclusively, so a plain aplay hits "Device or resource busy" and the slot
+# runs silently. paplay lives in pulseaudio-misc (there is no
+# pulseaudio-utils package in OE -- that is the Debian name), and the daemon
+# it connects to is pulseaudio-server, which does not pull misc in itself.
+# Both are in the image today only via packagegroup-bluetooth, i.e. only
+# while COMBINED_FEATURES has bluetooth -- name them here rather than borrow
+# them from an unrelated feature. alsa-utils covers the aplay fallback.
 
 pkg_postinst:${PN}() {
 #!/bin/sh -e
